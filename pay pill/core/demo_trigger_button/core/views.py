@@ -1,0 +1,374 @@
+from django.shortcuts import render, redirect
+from django.contrib.auth.decorators import login_required
+from django.http import JsonResponse
+from django.utils import timezone
+from datetime import timedelta, date
+from django.conf import settings
+from django.core.management import call_command
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_GET
+from medications.models import MedicationSchedule, DoseLog, Medication
+from accounts.models import User, CaregiverPatient
+from notifications.models import Escalation
+from notifications.escalation import resolve_for_dose, run_escalation_check
+import json
+from notifications.services import send_notification
+from medications.models import DoseLog
+
+def landing(request):
+    if request.user.is_authenticated:
+        return redirect('dashboard')
+    return render(request, 'core/landing.html')
+
+def handler404(request, exception):
+    return render(request, 'core/404.html', status=404)
+
+def handler500(request):
+    return render(request, 'core/500.html', status=500)
+
+@login_required
+def dashboard(request):
+    user = request.user
+    context = {'user': user}
+
+    if user.role == 'patient':
+        schedules = MedicationSchedule.objects.filter(patient=user, is_active=True).select_related('medication')
+        today = date.today()
+        today_logs = DoseLog.objects.filter(patient=user, scheduled_datetime__date=today).select_related('schedule__medication')
+        confirmed_today = today_logs.filter(status='confirmed').count()
+        total_today = today_logs.count() or schedules.count()
+
+        thirty_ago = timezone.now() - timedelta(days=30)
+        all_logs = DoseLog.objects.filter(patient=user, scheduled_datetime__gte=thirty_ago)
+        total = all_logs.count()
+        confirmed = all_logs.filter(status='confirmed').count()
+        missed = total - confirmed
+        adherence_pct = round((confirmed / total * 100) if total else 0)
+
+        # Streak
+        streak = 0
+        check = today
+        while True:
+            day_logs = DoseLog.objects.filter(patient=user, scheduled_datetime__date=check)
+            if day_logs.exists() and not day_logs.filter(status='missed').exists():
+                streak += 1
+                check -= timedelta(days=1)
+            else:
+                break
+
+        cal_days = []
+        for i in range(6, -1, -1):
+            d = today - timedelta(days=i)
+            day_logs = DoseLog.objects.filter(patient=user, scheduled_datetime__date=d)
+            if i == 0:
+                status = 'today'
+            elif day_logs.filter(status='missed').exists():
+                status = 'missed'
+            elif day_logs.filter(status='confirmed').exists():
+                status = 'confirmed'
+            else:
+                status = 'upcoming'
+            cal_days.append({'date': d, 'status': status, 'day_abbr': d.strftime('%a')[0]})
+
+        # Next pending dose
+        next_dose = schedules.first() if schedules.exists() else None
+        caregiver_links = CaregiverPatient.objects.filter(patient=user, approved=True).select_related('caregiver')
+
+        context.update({
+            'schedules': schedules,
+            'today_logs': today_logs,
+            'confirmed_today': confirmed_today,
+            'total_today': total_today,
+            'adherence_pct': adherence_pct,
+            'confirmed_30': confirmed,
+            'missed_30': missed,
+            'cal_days': cal_days,
+            'streak': streak,
+            'next_dose': next_dose,
+            'caregiver_links': caregiver_links,
+        })
+
+    elif user.role == 'caregiver':
+        links = CaregiverPatient.objects.filter(caregiver=user, approved=True).select_related('patient')
+        patient_data = []
+        for link in links:
+            p = link.patient
+            seven_ago = timezone.now() - timedelta(days=7)
+            logs = DoseLog.objects.filter(patient=p, scheduled_datetime__gte=seven_ago)
+            total = logs.count()
+            confirmed = logs.filter(status='confirmed').count()
+            pct = round((confirmed / total * 100) if total else 0)
+            missed_recent = logs.filter(status='missed').order_by('-scheduled_datetime').first()
+            last_confirmed = logs.filter(status='confirmed').order_by('-confirmed_at').first()
+            open_escalations = Escalation.objects.filter(
+                dose_log__patient=p, alert_sent_to=user, resolved=False
+            ).select_related('dose_log__schedule__medication').order_by('-sent_at')
+            patient_data.append({
+                'patient': p, 'pct': pct,
+                'missed_recent': missed_recent,
+                'last_confirmed': last_confirmed,
+                'open_escalations': open_escalations,
+                'link': link,
+            })
+        context['patient_data'] = patient_data
+
+    elif user.role == 'clinic_admin':
+        clinic = user.clinic
+        if clinic:
+            patients = User.objects.filter(clinic=clinic, role='patient')
+            total_patients = patients.count()
+            thirty_ago = timezone.now() - timedelta(days=30)
+            today = date.today()
+            all_logs = DoseLog.objects.filter(patient__in=patients, scheduled_datetime__gte=thirty_ago)
+            total_l = all_logs.count()
+            confirmed_l = all_logs.filter(status='confirmed').count()
+            avg_adherence = round((confirmed_l / total_l * 100) if total_l else 0)
+
+            today_logs = DoseLog.objects.filter(patient__in=patients, scheduled_datetime__date=today)
+            doses_today_confirmed = today_logs.filter(status='confirmed').count()
+            doses_today_total = today_logs.count()
+
+            at_risk = []
+            for p in patients:
+                logs = DoseLog.objects.filter(patient=p, scheduled_datetime__gte=thirty_ago)
+                t = logs.count()
+                c = logs.filter(status='confirmed').count()
+                pct = round((c / t * 100) if t else 0)
+                if pct < 80:
+                    last_log = logs.filter(status='confirmed').order_by('-confirmed_at').first()
+                    at_risk.append({'patient': p, 'pct': pct, 'missed': t - c, 'last_confirmed': last_log})
+            at_risk.sort(key=lambda x: x['pct'])
+
+            context.update({
+                'clinic': clinic,
+                'total_patients': total_patients,
+                'avg_adherence': avg_adherence,
+                'at_risk': at_risk,
+                'at_risk_count': len(at_risk),
+                'doses_today_confirmed': doses_today_confirmed,
+                'doses_today_total': doses_today_total,
+            })
+
+    return render(request, 'core/dashboard.html', context)
+
+@login_required
+def sms_simulator(request):
+    commands = [
+        ('1', 'Confirm dose taken'),
+        ('INFO [drug name]', 'Get medication information'),
+        ('REFILL', 'Check refill status'),
+        ('HELP', 'Get full command list'),
+        ('STOP', 'Pause reminders (not recommended)'),
+        ('START', 'Resume reminders'),
+    ]
+    return render(request, 'core/sms_simulator.html', {'commands': commands})
+
+@login_required
+def voice_channel(request):
+    steps = [
+        ('1', 'Automated call at scheduled time', 'Pill Pal calls your number at medication time — works on any phone, no data needed.'),
+        ('2', 'Listen to your reminder', 'A friendly voice reads your medication name, dosage, and instructions in your language.'),
+        ('3', 'Press 1 to confirm', 'Press 1 to confirm the dose. Press 2 to snooze 30 minutes. Press 0 for help.'),
+        ('4', 'Missed call confirmation', 'Call the Pill Pal number back and hang up to confirm — free, no data required.'),
+    ]
+    return render(request, 'core/voice_channel.html', {'steps': steps})
+
+@login_required
+def api_confirm_dose(request):
+    if request.method == 'POST':
+        try:
+               data = json.loads(request.body)
+        except Exception:
+               data = {}
+
+        log_id = data.get('log_id')
+        method = data.get('method', 'app')
+        if log_id:
+            try:
+                log = DoseLog.objects.get(pk=log_id, patient=request.user)
+                log.status = 'confirmed'
+                log.confirmed_at = timezone.now()
+                log.confirmation_method = method
+                log.save()
+                resolve_for_dose(log)
+                return JsonResponse({'success': True, 'message': 'Dose confirmed!'})
+            except DoseLog.DoesNotExist:
+                pass
+        # Fallback: confirm next pending
+        log = DoseLog.objects.filter(patient=request.user, status='pending').order_by('scheduled_datetime').first()
+        if log:
+            log.status = 'confirmed'
+            log.confirmed_at = timezone.now()
+            log.confirmation_method = method
+            log.save()
+            resolve_for_dose(log)
+        return JsonResponse({'success': True, 'message': 'Dose confirmed!'})
+    return JsonResponse({'success': False})
+
+@login_required
+def api_sms_respond(request):
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+        except Exception:
+            return JsonResponse({'reply': 'PILL PAL: Could not process your message.'})
+        message = data.get('message', '').strip().upper()
+        user = request.user
+        name = user.first_name or user.username
+        responses = {
+            '1': f'PILL PAL: ✓ Thank you {name}! Dose confirmed at {timezone.localtime().strftime("%H:%M")}. Keep it up! 💪',
+            'YES': f'PILL PAL: ✓ Dose confirmed, {name}! Well done.',
+            'HELP': 'PILL PAL COMMANDS:\n1 — Confirm dose\nINFO [drug] — Medication info\nREFILL — Refill status\nSTOP — Pause reminders\nSTART — Resume reminders\nEmergencies: call 10177',
+            'REFILL': 'PILL PAL: Your next refill is due soon. Please visit your clinic and bring your yellow patient card. Mon–Fri 08:00–16:30.',
+            'STOP': f'PILL PAL: Reminders paused for 24 hours, {name}. Reply START to resume. Important: staying on your medication is vital for your health.',
+            'START': f'PILL PAL: Reminders resumed, {name}! Great decision — consistent treatment leads to better health outcomes.',
+        }
+        if message in responses:
+            reply = responses[message]
+        elif message.startswith('INFO '):
+            drug = message[5:].strip()
+            med = Medication.objects.filter(generic_name__icontains=drug).first()
+            if med:
+                reply = (f'PILL PAL INFO — {med.generic_name}:\n'
+                         f'{med.description[:180]}\n'
+                         f'Side effects: {", ".join(med.side_effects_list()[:3])}.\n'
+                         f'Missed dose: {med.missed_dose_instructions[:80]}\nReply HELP for commands.')
+            else:
+                reply = f'PILL PAL: No info found for "{message[5:]}". Check spelling or ask your clinic. Reply HELP for commands.'
+        else:
+            reply = 'PILL PAL: Message not recognised. Reply HELP for a list of commands, or visit your clinic for assistance.'
+
+        
+        dose_log = DoseLog.objects.filter(patient=user, status='pending').order_by('scheduled_datetime').first()
+        send_notification(dose_log=dose_log, recipient=user, channel='sms',
+                          notification_type='sms_inbound', message=data.get('message', ''))
+        send_notification(dose_log=dose_log, recipient=user, channel='sms',
+                          notification_type='sms_reply', message=reply)
+
+        return JsonResponse({'reply': reply})
+    return JsonResponse({'reply': ''})
+
+@csrf_exempt
+@require_GET
+def run_seed_data(request):
+    """
+    Free-tier Render has no Shell access, so python manage.py seed_data can't
+    be run directly on the deployed instance. This endpoint runs it instead,
+    from a browser visit:
+
+        GET /internal/run-seed-data/?token=<CRON_SECRET>
+
+    Reuses CRON_SECRET (see /internal/run-scheduled-tasks/, if present) rather
+    than a separate secret -- one shared value to manage, not two.
+
+    Safe to call more than once: seed_data uses get_or_create for its
+    reference data (clinic, medications), so re-running tops up anything
+    missing without duplicating what's already there. It is NOT safe to leave
+    this endpoint callable indefinitely in a real production app (anyone with
+    the token can re-seed demo data at will) -- fine for a free-tier class
+    project with no real patient data, but note this if the project is ever
+    extended beyond that.
+    """
+    token = request.GET.get('token', '')
+    if token != settings.CRON_SECRET:
+        return JsonResponse({'error': 'invalid token'}, status=403)
+
+    try:
+        call_command('seed_data')
+    except Exception as e:
+        return JsonResponse({'ok': False, 'error': str(e)}, status=500)
+
+    return JsonResponse({'ok': True, 'ran_at': timezone.now().isoformat()})
+
+
+@csrf_exempt
+@require_GET
+def run_create_superuser(request):
+    """
+    Free-tier Render has no Shell access, so `python manage.py createsuperuser`
+    can't be run interactively on the deployed instance. This creates one
+    fixed superuser account instead, from a browser visit:
+
+        GET /internal/run-create-superuser/?token=<CRON_SECRET>
+
+    Reuses CRON_SECRET, same as /internal/run-seed-data/.
+
+    Unlike seed_data, this is intentionally NOT safe to call repeatedly: if
+    the account already exists, it refuses rather than silently resetting the
+    password, so a stray second visit to this URL can't quietly take over an
+    account you've since changed the password on.
+
+    Security note: this endpoint, like /internal/run-seed-data/, should only
+    ever be reachable with the CRON_SECRET token, and is appropriate for a
+    free-tier class project with no real patient data -- it is not a pattern
+    to carry into a real production deployment.
+    """
+    token = request.GET.get('token', '')
+    if token != settings.CRON_SECRET:
+        return JsonResponse({'error': 'invalid token'}, status=403)
+
+    username = 'admin'
+    password = request.GET.get('password', '')
+    if not password:
+        return JsonResponse({'error': 'pass ?password=<new password> in the URL'}, status=400)
+
+    if User.objects.filter(username=username).exists():
+        return JsonResponse({
+            'ok': False,
+            'error': f'A user named "{username}" already exists -- not touching it. '
+                     f'Use the Django admin to reset its password instead, or delete it first.',
+        }, status=409)
+
+    User.objects.create_superuser(username=username, password=password, role='clinic_admin')
+    return JsonResponse({'ok': True, 'username': username, 'ran_at': timezone.now().isoformat()})
+
+
+@login_required
+def demo_trigger_missed_dose(request):
+    """
+    Demo helper: lets a logged-in patient instantly simulate having missed a
+    dose, for live demonstration of the escalation protocol without waiting
+    real time or using the shell (which isn't available on Render's free
+    tier). Button lives on the patient dashboard.
+
+    POST only, since it creates real data -- a GET to this URL (e.g. a stray
+    link click, a crawler) must not trigger it.
+
+    Picks the patient's first active medication schedule, creates a DoseLog
+    for 90 minutes ago (just past the Level 1 threshold), and immediately
+    runs the escalation check so the resulting alert appears right away
+    rather than waiting for the next scheduled/polled check.
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=405)
+
+    if request.user.role != 'patient':
+        return JsonResponse({'error': 'Only available for patient accounts'}, status=403)
+
+    schedule = MedicationSchedule.objects.filter(
+        patient=request.user, is_active=True
+    ).select_related('medication').first()
+
+    if not schedule:
+        return JsonResponse({
+            'ok': False,
+            'error': 'No active medication schedule found for this account. '
+                     'Add a medication schedule first, then try again.',
+        }, status=400)
+
+    now = timezone.now()
+    dose = DoseLog.objects.create(
+        schedule=schedule,
+        patient=request.user,
+        scheduled_datetime=now - timedelta(minutes=90),
+        status='pending',
+    )
+    result = run_escalation_check(now)
+
+    return JsonResponse({
+        'ok': True,
+        'medication': schedule.medication.generic_name,
+        'dose_id': dose.pk,
+        'level1_escalations': result.level1_created,
+        'level2_escalations': result.level2_created,
+    })
