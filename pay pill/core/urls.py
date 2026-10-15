@@ -11,4 +11,5 @@ urlpatterns = [
     path('internal/run-seed-data/', views.run_seed_data, name='run_seed_data'),
     path('internal/run-create-superuser/', views.run_create_superuser, name='run_create_superuser'),
     path('demo/trigger-missed-dose/', views.demo_trigger_missed_dose, name='demo_trigger_missed_dose'),
+    path('caregiver/send-sms/<int:patient_id>/', views.caregiver_send_sms, name='caregiver_send_sms'),
 ]
