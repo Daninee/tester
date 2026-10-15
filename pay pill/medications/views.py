@@ -7,7 +7,7 @@ from datetime import date
 from .models import Medication, MedicationSchedule, DoseLog
 from notifications.escalation import resolve_for_dose
 import json
-from .sms_utils import send_sms_via_textbee
+from .sms_utils import send_sms_via_textbee, normalize_sa_phone
 
 @login_required
 def medication_list(request):
@@ -69,15 +69,8 @@ def schedule_add(request):
             # --- Send confirmation SMS via TextBee ---
             patient_phone = getattr(request.user, 'phone_number', None) or getattr(request.user, 'phone', None)
             if patient_phone:
-                # Normalize to E.164 format for South Africa
-                phone = str(patient_phone).strip()
-                if phone.startswith('0'):
-                    phone = '+27' + phone[1:]
-                elif not phone.startswith('+'):
-                    phone = '+27' + phone
-
                 result = send_sms_via_textbee(
-                    phone,
+                    normalize_sa_phone(patient_phone),
                     f"PillPal: Your reminder for {med.generic_name} has been set. "
                     f"You'll receive SMS alerts at the scheduled times."
                 )
