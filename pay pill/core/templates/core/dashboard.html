@@ -188,7 +188,7 @@
     </div>
     <div style="display:flex;flex-direction:column;gap:8px;">
       <button class="btn btn-primary btn-sm" onclick="showToast('Opening report for {{ p.first_name }}…')">Report</button>
-      <button class="btn btn-ghost btn-sm" onclick="showToast('Encouragement SMS sent to {{ p.first_name }}')">Send SMS</button>
+      <button class="btn btn-ghost btn-sm" id="sendSmsBtn-{{ p.pk }}" onclick="sendCaregiverSms({{ p.pk }}, '{{ p.first_name|escapejs }}')">Send SMS</button>
     </div>
   </div>
   {% endwith %}
@@ -379,6 +379,36 @@ document.addEventListener('visibilitychange', function () {
   }
 });
 {% endif %}
+
+function sendCaregiverSms(patientId, patientName) {
+  var btn = document.getElementById('sendSmsBtn-' + patientId);
+  var originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+
+  fetch('/caregiver/send-sms/' + patientId + '/', {
+    method: 'POST',
+    headers: {'X-CSRFToken': '{{ csrf_token }}'}
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    btn.disabled = false;
+    btn.textContent = originalText;
+    if (d.ok && d.sms_sent) {
+      showToast('✅ SMS sent to ' + patientName);
+    } else if (d.ok && !d.sms_sent) {
+      // Notification was logged, but the real SMS didn't go through
+      // (e.g. no phone number on file, or TextBee/signal issue) --
+      // tell the caregiver plainly rather than claiming success.
+      showToast('⚠ Logged, but SMS did not send to ' + patientName + ' (' +
+                (d.sms_detail && d.sms_detail.error ? d.sms_detail.error : 'see logs') + ')', 5000);
+    } else {
+      showToast('❌ Could not send SMS to ' + patientName);
+    }
+  }).catch(function () {
+    btn.disabled = false;
+    btn.textContent = originalText;
+    showToast('❌ Request failed — check your connection.');
+  });
+}
 
 function triggerDemoMissedDose() {
   var btn = document.getElementById('demoTriggerBtn');
