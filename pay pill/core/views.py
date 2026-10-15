@@ -14,6 +14,7 @@ from notifications.escalation import resolve_for_dose, run_escalation_check
 import json
 from notifications.services import send_notification
 from medications.models import DoseLog
+from medications.sms_utils import send_sms_via_textbee, normalize_sa_phone
 
 def landing(request):
     if request.user.is_authenticated:
@@ -371,4 +372,62 @@ def demo_trigger_missed_dose(request):
         'dose_id': dose.pk,
         'level1_escalations': result.level1_created,
         'level2_escalations': result.level2_created,
+    })
+
+
+@login_required
+def caregiver_send_sms(request, patient_id):
+    """
+    Wires the caregiver dashboard's 'Send SMS' button to a real send, instead
+    of the placeholder toast it previously called directly in the template.
+
+    Only the patient's own approved caregiver may use this -- checked the
+    same way /notifications/escalations/poll/ scopes a caregiver to their own
+    patients, so this can't be used to message someone else's patient.
+
+    Creates a real Notification record (so it shows in the patient's
+    notification history, consistent with every other message in the app)
+    and attempts an actual TextBee SMS send if the patient has a phone number
+    on file. If TextBee fails (as in the earlier 'no cellular service' case),
+    the Notification is still created and marked accordingly -- the caregiver
+    sees a clear status either way, rather than a silent success that didn't
+    really send anything.
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=405)
+
+    patient = User.objects.filter(pk=patient_id, role='patient').first()
+    if not patient:
+        return JsonResponse({'error': 'Patient not found'}, status=404)
+
+    is_approved_caregiver = CaregiverPatient.objects.filter(
+        caregiver=request.user, patient=patient, approved=True
+    ).exists()
+    if not is_approved_caregiver:
+        return JsonResponse({'error': 'Not an approved caregiver for this patient'}, status=403)
+
+    message = request.POST.get('message', '').strip() or (
+        f"PillPal: {request.user.get_full_name() or request.user.username} "
+        f"is checking in on you. Don't forget your medication today!"
+    )
+
+    notification = send_notification(
+        recipient=patient, channel='sms', notification_type='reminder', message=message,
+    )
+
+    textbee_result = None
+    patient_phone = getattr(patient, 'phone_number', None) or getattr(patient, 'phone', None)
+    if patient_phone:
+        textbee_result = send_sms_via_textbee(normalize_sa_phone(patient_phone), message)
+    else:
+        textbee_result = {'error': 'Patient has no phone number on file'}
+
+    textbee_ok = isinstance(textbee_result, dict) and 'error' not in textbee_result
+
+    return JsonResponse({
+        'ok': True,
+        'notification_id': notification.pk,
+        'message': message,
+        'sms_sent': textbee_ok,
+        'sms_detail': textbee_result,
     })
